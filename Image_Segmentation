@@ -1,0 +1,545 @@
+"""
+SEM island segmentation and morphology analysis.
+
+Segments bright islands (film / particles) from dark holes (substrate) in SEM
+images and computes per-image and pooled morphology statistics.
+
+Pipeline (per image)
+--------------------
+1. Convert to 8-bit grayscale.
+   Optional: subtract the background (rolling-ball style) to remove
+   brightness gradients across the image (BACKGROUND_KERNEL_PX).
+2-4. Threshold, with one of two methods (THRESHOLD_METHOD):
+   "triangle_otsu" (default): CLAHE (clip limit 2.0, 8x8 tiles), 3x3 median
+   filter, then a global Triangle threshold. If the result is degenerate
+   (threshold < 10, or < 2 % / > 98 % white pixels), fall back to Otsu.
+   "adaptive": optional CLAHE, a denoising filter (bilateral, median or
+   Gaussian), then an adaptive Gaussian threshold: each pixel is compared
+   with the mean of its own neighbourhood. Handles brightness gradients.
+5. Fill black components (holes) smaller than ``min_hole_size`` and
+   remove white components (particles) smaller than ``min_particle_size``.
+6. Analyse every island that does not touch the image border. Internal
+   holes are subtracted from the island area.
+
+Reported quantities
+-------------------
+- Equivalent circular diameter (ECD):  d = sqrt(4 A / pi)
+- Circularity:                         C = 4 pi A / P^2
+- Particle density (islands per um^2)
+- Total and area-normalised contour length
+- Covered area: all white pixels, and interior (non-edge) islands only
+- Volume, surface area and surface-to-volume ratio, assuming each island is
+  a sphere with diameter equal to its ECD (an approximation)
+
+Pooled ("grand") statistics
+---------------------------
+- ECD and circularity: mean and standard deviation over all islands pooled
+  from all images.
+- Density and covered area: mean and standard deviation over the per-image
+  values.
+All standard deviations are population standard deviations (numpy default,
+ddof = 0).
+
+Outputs (written to the output directory)
+-----------------------------------------
+- binary_<image>.png     segmented mask (white = islands, black = holes)
+- overlay_<image>.png    analysed contours drawn in red on the original image
+- SEM_Advanced_Analysis.xlsx  per-image results plus grand mean / std rows
+
+Usage
+-----
+Fill in the USER SETTINGS section below, then run the script
+(e.g. press Run in Spyder / VS Code, or `python sem_island_analysis.py`).
+"""
+
+import glob
+import os
+
+import cv2
+import numpy as np
+import pandas as pd
+
+# =============================================================================
+# USER SETTINGS – edit these before running
+# =============================================================================
+
+# Folder containing the SEM images (.png, .tif, .tiff). Every image in this
+# folder is processed. Keep the r in front of the quotes.
+INPUT_DIR = r"Q:\Gemini SEM\Master Arbeit\5nm\Ar\PlainImages\seg5k"
+
+# Folder for the masks, overlays and Excel file. None = "analysis_output"
+# inside INPUT_DIR.
+OUTPUT_DIR = None
+
+# Pixel size in nm/px. Depends on the magnification (e.g. 22.33 at 5kX,
+# 5.582 at 20kX).
+PIXEL_SIZE_NM = 22.33
+
+# Black holes smaller than this (px) are filled. 1 = keep all.
+MIN_HOLE_SIZE = 1
+
+# White particles smaller than this (px) are removed. 1 = keep all.
+MIN_PARTICLE_SIZE = 2
+
+# Background subtraction, for images that get darker (or brighter) towards
+# one side. Without it, islands in the dark part fall below the global
+# threshold and disappear from the mask.
+# Set to the diameter (px) of a disk that is clearly LARGER than the widest
+# island, about 2-3x the island width. None = off.
+BACKGROUND_KERNEL_PX = None
+
+# Threshold method:
+#   "triangle_otsu" - one global threshold for the whole image (Triangle,
+#                     Otsu as fallback). Best for evenly lit images.
+#   "adaptive"      - a separate threshold for every pixel, from its
+#                     neighbourhood. Use when brightness drifts across the
+#                     image and islands on the darker side go missing.
+THRESHOLD_METHOD = "adaptive"
+
+# Adaptive threshold settings (only used when THRESHOLD_METHOD = "adaptive").
+# Block size: neighbourhood width in px (odd). Make it several times wider
+#   than the largest island, or big islands get hollow centres.
+# C: a pixel counts as island if it is brighter than (local mean - C).
+#   More negative C = stricter (smaller islands, less background speckle);
+#   less negative / positive C = islands grow and noise appears.
+# Denoise: "bilateral" (keeps edges and thin bridges), "median" (removes
+#   grainy noise, keeps edges) or "gaussian" (smooth, slightly blurs edges).
+# Tested starting points:
+#   dense networks with thin bridges:  55, -5, "bilateral", CLAHE True
+#   contrast varies a lot:             201, -2, "gaussian", CLAHE True
+#   low-contrast networks:             101, -2, "gaussian", CLAHE False
+#   noisy images:                      151, -3, "median",   CLAHE False
+ADAPTIVE_BLOCK_SIZE = 55
+ADAPTIVE_C = -5
+ADAPTIVE_DENOISE = "bilateral"
+ADAPTIVE_USE_CLAHE = True
+
+# Print the threshold details for each image.
+VERBOSE = False
+
+# =============================================================================
+# Fixed method parameters
+# =============================================================================
+
+# Preprocessing
+CLAHE_CLIP_LIMIT = 2.0
+CLAHE_TILE_GRID = (8, 8)
+MEDIAN_KERNEL_SIZE = 3          # triangle_otsu method
+
+# Denoising filters for the adaptive method
+ADAPTIVE_MEDIAN_KERNEL = 7
+ADAPTIVE_GAUSSIAN_KERNEL = 5
+BILATERAL_DIAMETER = 10
+BILATERAL_SIGMA = 50
+
+# Sanity limits for the Triangle threshold; outside these, Otsu is used
+MIN_THRESHOLD_VALUE = 10
+MIN_WHITE_PCT = 2.0
+MAX_WHITE_PCT = 98.0
+
+IMAGE_PATTERNS = ("*.png", "*.tif", "*.tiff")
+CONTOUR_COLOUR = (0, 0, 255)    # red (BGR)
+EXCEL_FILENAME = "SEM_Advanced_Analysis.xlsx"
+
+COLUMNS = [
+    "Image",
+    "Mean Diameter (nm)",
+    "Std Dev Diameter (nm)",
+    "Mean Circularity",
+    "Std Dev Circularity",
+    "Particle Count",
+    "Particle Density (particles/µm²)",
+    "Total Contour Length (nm)",
+    "Total Contour Length Normalised (nm/µm²)",
+    "Covered Area – all pixels incl. edge (%)",
+    "Covered Area – interior particles only (%)",
+    "Total Volume (nm³)",
+    "Total Surface Area (nm²)",
+    "Surface-to-Volume Ratio (nm⁻¹)",
+]
+
+
+# =============================================================================
+# Image utilities
+# =============================================================================
+
+def pct_white(mask):
+    """Return the percentage of non-zero pixels in a binary mask."""
+    return 100.0 * cv2.countNonZero(mask) / mask.size
+
+
+def to_gray_8bit(img):
+    """Convert an image of any channel count / bit depth to 8-bit grayscale."""
+    if img.ndim == 3:
+        code = cv2.COLOR_BGRA2GRAY if img.shape[2] == 4 else cv2.COLOR_BGR2GRAY
+        img = cv2.cvtColor(img, code)
+    if img.dtype != np.uint8:
+        img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+    return img
+
+
+def make_overlay_base(img):
+    """Return a contrast-stretched 8-bit BGR copy of the image for drawing on."""
+    img_8u = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+    if img_8u.ndim == 2:
+        return cv2.cvtColor(img_8u, cv2.COLOR_GRAY2BGR)
+    if img_8u.shape[2] == 4:
+        return cv2.cvtColor(img_8u, cv2.COLOR_BGRA2BGR)
+    return img_8u.copy()
+
+
+def remove_small_components(mask, min_size, connectivity):
+    """Keep only white connected components with an area of at least min_size px."""
+    _, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=connectivity)
+    keep = np.where(stats[:, cv2.CC_STAT_AREA] >= min_size)[0]
+    keep = keep[keep > 0]  # label 0 is the background
+    return np.isin(labels, keep).astype(np.uint8) * 255
+
+
+def is_on_edge(contour, shape, margin=1):
+    """Return True if any contour point lies within `margin` px of the image border."""
+    h, w = shape[:2]
+    pts = contour[:, 0, :]
+    return bool(
+        np.any(pts[:, 0] <= margin)
+        or np.any(pts[:, 0] >= w - 1 - margin)
+        or np.any(pts[:, 1] <= margin)
+        or np.any(pts[:, 1] >= h - 1 - margin)
+    )
+
+
+# =============================================================================
+# Segmentation
+# =============================================================================
+
+def subtract_background(gray, kernel_px):
+    """Remove slow brightness variations (rolling-ball style).
+
+    The background is estimated with a morphological opening using a disk
+    larger than any island: the opening removes every bright island and keeps
+    the substrate level between them. It is smoothed and subtracted from the
+    image, and the result is stretched back to 0-255.
+    """
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_px, kernel_px))
+    background = cv2.morphologyEx(cv2.medianBlur(gray, 5), cv2.MORPH_OPEN, kernel)
+    background = cv2.GaussianBlur(background, (0, 0), kernel_px / 4)
+    flat = cv2.subtract(gray, background)  # saturates at 0
+    return cv2.normalize(flat, None, 0, 255, cv2.NORM_MINMAX)
+
+
+def triangle_otsu_threshold(gray, name="", verbose=False):
+    """CLAHE + median filter, then a global Triangle threshold with Otsu as
+    fallback for degenerate results. Returns (binary, threshold value)."""
+    clahe = cv2.createCLAHE(clipLimit=CLAHE_CLIP_LIMIT, tileGridSize=CLAHE_TILE_GRID)
+    blurred = cv2.medianBlur(clahe.apply(gray), MEDIAN_KERNEL_SIZE)
+
+    thresh_val, binary = cv2.threshold(
+        blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_TRIANGLE
+    )
+    white = pct_white(binary)
+    if thresh_val < MIN_THRESHOLD_VALUE or not (MIN_WHITE_PCT <= white <= MAX_WHITE_PCT):
+        otsu_val, binary = cv2.threshold(
+            blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+        )
+        if verbose:
+            print(f"  [{name}] Triangle rejected (thresh={thresh_val:.0f}, "
+                  f"white={white:.1f} %); using Otsu (thresh={otsu_val:.0f})")
+        thresh_val = otsu_val
+    return binary, thresh_val
+
+
+def adaptive_threshold(gray, block_size, c, denoise="bilateral", use_clahe=True):
+    """Optional CLAHE + denoising, then an adaptive Gaussian threshold.
+
+    Each pixel is compared with the Gaussian-weighted mean of its
+    block_size x block_size neighbourhood: it becomes white if it is brighter
+    than (local mean - c). Returns (binary, NaN), as there is no single
+    threshold value.
+    """
+    if block_size < 3 or block_size % 2 == 0:
+        raise ValueError("ADAPTIVE_BLOCK_SIZE must be odd and at least 3.")
+
+    img = gray
+    if use_clahe:
+        img = cv2.createCLAHE(clipLimit=CLAHE_CLIP_LIMIT,
+                              tileGridSize=CLAHE_TILE_GRID).apply(img)
+
+    if denoise == "bilateral":
+        img = cv2.bilateralFilter(img, BILATERAL_DIAMETER, BILATERAL_SIGMA, BILATERAL_SIGMA)
+    elif denoise == "median":
+        img = cv2.medianBlur(img, ADAPTIVE_MEDIAN_KERNEL)
+    elif denoise == "gaussian":
+        img = cv2.GaussianBlur(img, (ADAPTIVE_GAUSSIAN_KERNEL, ADAPTIVE_GAUSSIAN_KERNEL), 0)
+    elif denoise is not None:
+        raise ValueError("ADAPTIVE_DENOISE must be 'bilateral', 'median' or 'gaussian'.")
+
+    binary = cv2.adaptiveThreshold(img, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                   cv2.THRESH_BINARY, block_size, c)
+    return binary, float("nan")
+
+
+def segment_image(img, min_hole_size, min_particle_size, name="", verbose=False,
+                  background_kernel=None, method="triangle_otsu", adaptive=None):
+    """
+    Segment an SEM image into islands (white, 255) and holes (black, 0).
+
+    method = "triangle_otsu": one global threshold; suited to roughly circular
+    islands / dark holes on an evenly lit, fairly uniform grey film.
+    method = "adaptive": local threshold; for brightness gradients. `adaptive`
+    is a dict with block_size, c, denoise and use_clahe.
+
+    Returns
+    -------
+    binary : np.ndarray (uint8)
+        Final cleaned mask.
+    thresh_val : float
+        Threshold value that was applied (NaN for adaptive).
+    """
+    gray = to_gray_8bit(img)
+    if background_kernel:
+        gray = subtract_background(gray, background_kernel)
+
+    if method == "triangle_otsu":
+        binary, thresh_val = triangle_otsu_threshold(gray, name, verbose)
+    elif method == "adaptive":
+        binary, thresh_val = adaptive_threshold(gray, **(adaptive or {}))
+    else:
+        raise ValueError("THRESHOLD_METHOD must be 'triangle_otsu' or 'adaptive'.")
+
+    # Fill small black holes (4-connectivity on the inverted mask)
+    holes = remove_small_components(cv2.bitwise_not(binary), min_hole_size, connectivity=4)
+    binary = cv2.bitwise_not(holes)
+
+    # Remove small white particles (8-connectivity)
+    if min_particle_size is not None and min_particle_size > 1:
+        binary = remove_small_components(binary, min_particle_size, connectivity=8)
+
+    if verbose:
+        print(f"  [{name}] threshold = {thresh_val:.0f}, "
+              f"white after cleanup = {pct_white(binary):.2f} %")
+
+    return binary, thresh_val
+
+
+# =============================================================================
+# Island analysis
+# =============================================================================
+
+def analyse_islands(binary, px_nm, overlay=None, thickness=1):
+    """
+    Measure every island that does not touch the image border.
+
+    Internal holes (child contours) are subtracted from the island area.
+    If `overlay` is given, analysed contours are drawn on it in red.
+
+    Returns
+    -------
+    dict with lists 'diams_nm' and 'circularities', and floats
+    'contour_length_nm' and 'interior_area_px'.
+    """
+    contours, hierarchy = cv2.findContours(binary, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+
+    result = {
+        "diams_nm": [],
+        "circularities": [],
+        "contour_length_nm": 0.0,
+        "interior_area_px": 0.0,
+    }
+    if hierarchy is None:
+        return result
+
+    hierarchy = hierarchy[0]  # rows: [next, previous, first_child, parent]
+
+    for i, cnt in enumerate(contours):
+        if hierarchy[i, 3] != -1:       # skip hole contours; handled via parent
+            continue
+        if is_on_edge(cnt, binary.shape):
+            continue
+
+        net_area_px = cv2.contourArea(cnt)
+        perimeter_px = cv2.arcLength(cnt, True)
+
+        # Subtract the area of each internal hole
+        child = hierarchy[i, 2]
+        while child != -1:
+            net_area_px -= cv2.contourArea(contours[child])
+            if overlay is not None:
+                cv2.drawContours(overlay, contours, child, CONTOUR_COLOUR, thickness)
+            child = hierarchy[child, 0]
+
+        if net_area_px <= 0:
+            continue
+
+        ecd_nm = np.sqrt(4 * net_area_px / np.pi) * px_nm
+        circularity = 4 * np.pi * net_area_px / perimeter_px ** 2 if perimeter_px > 0 else 0
+
+        result["diams_nm"].append(ecd_nm)
+        result["circularities"].append(circularity)
+        result["contour_length_nm"] += perimeter_px * px_nm
+        result["interior_area_px"] += net_area_px
+
+        if overlay is not None:
+            cv2.drawContours(overlay, contours, i, CONTOUR_COLOUR, thickness)
+
+    return result
+
+
+def image_statistics(name, binary, islands, px_nm):
+    """Compute the per-image result row from the mask and island measurements."""
+    h, w = binary.shape[:2]
+    total_px = h * w
+    image_area_um2 = (h * px_nm * 1e-3) * (w * px_nm * 1e-3)
+
+    diams = np.asarray(islands["diams_nm"])
+    circs = np.asarray(islands["circularities"])
+    count = len(diams)
+
+    # Volume and surface area assume spheres of diameter = ECD
+    volumes = (np.pi / 6) * diams ** 3
+    surfaces = np.pi * diams ** 2
+    tot_vol = float(volumes.sum())
+    tot_surf = float(surfaces.sum())
+
+    return {
+        "Image": name,
+        "Mean Diameter (nm)": diams.mean() if count else 0,
+        "Std Dev Diameter (nm)": diams.std() if count else 0,
+        "Mean Circularity": circs.mean() if count else 0,
+        "Std Dev Circularity": circs.std() if count else 0,
+        "Particle Count": count,
+        "Particle Density (particles/µm²)": count / image_area_um2,
+        "Total Contour Length (nm)": islands["contour_length_nm"],
+        "Total Contour Length Normalised (nm/µm²)": islands["contour_length_nm"] / image_area_um2,
+        "Covered Area – all pixels incl. edge (%)": 100.0 * cv2.countNonZero(binary) / total_px,
+        "Covered Area – interior particles only (%)": 100.0 * islands["interior_area_px"] / total_px,
+        "Total Volume (nm³)": tot_vol,
+        "Total Surface Area (nm²)": tot_surf,
+        "Surface-to-Volume Ratio (nm⁻¹)": tot_surf / tot_vol if tot_vol > 0 else 0,
+    }
+
+
+def mean_std(values):
+    """Return (mean, population std) of a list, or (0, 0) if empty."""
+    if len(values) == 0:
+        return 0, 0
+    return np.mean(values), np.std(values)
+
+
+# =============================================================================
+# Batch processing
+# =============================================================================
+
+def find_images(input_dir):
+    paths = []
+    for pattern in IMAGE_PATTERNS:
+        paths.extend(glob.glob(os.path.join(input_dir, pattern)))
+    return sorted(set(paths))
+
+
+def process_images(input_dir, output_dir, px_nm, min_hole_size, min_particle_size,
+                   verbose=False, background_kernel=None, method="triangle_otsu",
+                   adaptive=None):
+    image_paths = find_images(input_dir)
+    if not image_paths:
+        print(f"No images found in {input_dir}")
+        return None
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    rows = []
+    all_diams, all_circs = [], []
+
+    for path in image_paths:
+        filename = os.path.basename(path)
+        name = os.path.splitext(filename)[0]
+
+        img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        if img is None:
+            print(f"Could not read {filename}, skipping.")
+            continue
+
+        binary, _ = segment_image(img, min_hole_size, min_particle_size,
+                                  name=filename, verbose=verbose,
+                                  background_kernel=background_kernel,
+                                  method=method, adaptive=adaptive)
+
+        overlay = make_overlay_base(img)
+        thickness = max(1, round(min(binary.shape[:2]) / 512))
+        islands = analyse_islands(binary, px_nm, overlay, thickness)
+
+        rows.append(image_statistics(filename, binary, islands, px_nm))
+        all_diams.extend(islands["diams_nm"])
+        all_circs.extend(islands["circularities"])
+
+        cv2.imwrite(os.path.join(output_dir, f"binary_{name}.png"), binary)
+        overlay_path = os.path.join(output_dir, f"overlay_{name}.png")
+        if cv2.imwrite(overlay_path, overlay):
+            print(f"Processed: {name} | Islands analysed: {len(islands['diams_nm'])}")
+        else:
+            print(f"FAILED to save overlay: {overlay_path}")
+
+    if not rows:
+        print("No images could be processed.")
+        return None
+
+    df = pd.DataFrame(rows, columns=COLUMNS)
+
+    # --- Grand statistics -----------------------------------------------------
+    ecd = mean_std(all_diams)
+    circ = mean_std(all_circs)
+    density = mean_std(df["Particle Density (particles/µm²)"].to_numpy())
+    coverage = mean_std(df["Covered Area – all pixels incl. edge (%)"].to_numpy())
+
+    print("\n" + "=" * 60)
+    print(f"GRAND STATISTICS ({len(rows)} images, {len(all_diams)} islands)")
+    print("=" * 60)
+    print(f"ECD:              {ecd[0]:.2f} ± {ecd[1]:.2f} nm")
+    print(f"Circularity:      {circ[0]:.4f} ± {circ[1]:.4f}")
+    print(f"Particle density: {density[0]:.2f} ± {density[1]:.2f} particles/µm²")
+    print(f"Covered area:     {coverage[0]:.2f} ± {coverage[1]:.2f} %")
+    print("=" * 60 + "\n")
+
+    summary = pd.DataFrame(
+        [
+            {"Image": "GRAND MEAN",
+             "Mean Diameter (nm)": ecd[0],
+             "Mean Circularity": circ[0],
+             "Particle Density (particles/µm²)": density[0],
+             "Covered Area – all pixels incl. edge (%)": coverage[0]},
+            {"Image": "GRAND STD DEV",
+             "Mean Diameter (nm)": ecd[1],
+             "Mean Circularity": circ[1],
+             "Particle Density (particles/µm²)": density[1],
+             "Covered Area – all pixels incl. edge (%)": coverage[1]},
+        ],
+        columns=COLUMNS,
+    )
+    df = pd.concat([df, summary], ignore_index=True)
+
+    excel_path = os.path.join(output_dir, EXCEL_FILENAME)
+    df.to_excel(excel_path, index=False)
+    print(f"Saved results to: {excel_path}")
+    return df
+
+
+# =============================================================================
+# Run
+# =============================================================================
+
+if __name__ == "__main__":
+    process_images(
+        input_dir=INPUT_DIR,
+        output_dir=OUTPUT_DIR or os.path.join(INPUT_DIR, "analysis_output"),
+        px_nm=PIXEL_SIZE_NM,
+        min_hole_size=MIN_HOLE_SIZE,
+        min_particle_size=MIN_PARTICLE_SIZE,
+        verbose=VERBOSE,
+        background_kernel=BACKGROUND_KERNEL_PX,
+        method=THRESHOLD_METHOD,
+        adaptive={
+            "block_size": ADAPTIVE_BLOCK_SIZE,
+            "c": ADAPTIVE_C,
+            "denoise": ADAPTIVE_DENOISE,
+            "use_clahe": ADAPTIVE_USE_CLAHE,
+        },
+    )
