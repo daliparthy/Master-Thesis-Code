@@ -32,7 +32,7 @@ import pandas as pd
 # CONFIGURATION
 # =============================================================================
 
-ROOT_DIR = r"Q:\Gemini SEM\Master Arbeit\10nm_depRateOff\10 nm hole sizes"
+ROOT_DIR = r""
 
 pixel_size_nm = 5.582
 
