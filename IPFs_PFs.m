@@ -9,8 +9,8 @@ setMTEXpref('zAxisDirection', 'intoPlane');
 setMTEXpref('defaultColorMap', parula); 
 
 % --- 1. Define Input and Output Folders ---
-dataFolder = 'Q:\EBSD\Master Thesis\10nm_depRateOff\Ar O2\ang files';
-outRoot    = 'Q:\EBSD\Master Thesis\10nm_depRateOff\Ar O2\2026_09_07';
+dataFolder = '\ang files';
+outRoot    = '';
 fileList   = dir(fullfile(dataFolder, '*.ang'));
 
 % --- 2. Global Variables for CSL Length Aggregation ---
