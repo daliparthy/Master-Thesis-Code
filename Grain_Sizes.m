@@ -10,8 +10,8 @@ setMTEXpref('zAxisDirection', 'intoPlane');
 setMTEXpref('defaultColorMap', parula); 
 
 % Define the input and output directories
-data_dir = 'Q:\EBSD\Master Thesis\5nm\30k\vacuum\ang files'; 
-outDir = 'Q:\EBSD\Master Thesis\5nm\30k\vacuum\newGrainSizeStats';
+data_dir = '\ang files'; 
+outDir = '\GrainSizeStats';
 
 if ~exist(outDir, 'dir'); mkdir(outDir); end
 
